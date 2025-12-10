@@ -1,26 +1,28 @@
 <# : batch portion
 @echo off
 :: ===========================================================================
-::  IITD Proxy Keep-Alive Utility
+::   IITD Proxy Keep-Alive Utility
 :: ===========================================================================
-::  Author:      Akhil A
-::  Version:     2.6
-::  Date:        2025-12-06
-::  License:     MIT
-::  Description: Automates authentication for IIT Delhi Proxy servers.
-::               Prevents session timeouts and manages system proxy settings.
-::               Most of the code is written by Claude Opus 4.5 and Gemini 3.0.
-::  URL:         https://akhilabburu.github.io/iitd/proxy_persistent.html
+::   Author:       Akhil A
+::   Version:      2.7
+::   Date:         2025-12-10
+::   License:      MIT
+::   Description:  Automates authentication for IIT Delhi Proxy servers.
+::                 Prevents session timeouts and manages system proxy settings.
+::                 Most of the code is written by Claude Opus 4.5 and Gemini 3.0.
+::   URL:          https://akhilabburu.github.io/iitd/proxy_persistent.html
 :: ===========================================================================
 
-:: Minimize the console window immediately to reduce visual clutter
-if "%1"=="min" goto :run
-start "" /min cmd /c "%~f0" min
+:: Check for hidden flag. If not present, launch invisible instance and exit.
+if "%1"=="h" goto :run
+powershell -NoProfile -WindowStyle Hidden -Command "$w=New-Object -ComObject WScript.Shell;$w.Run('cmd /c \""%~f0\"" h',0)"
 exit
+
 :run
 title IITD Proxy Keep-Alive
 cd /d %~dp0
-powershell -NoProfile -ExecutionPolicy Bypass -Command "iex ((Get-Content '%~f0') -join [Environment]::NewLine)"
+:: Load the PowerShell portion below using Invoke-Expression
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Invoke-Command -ScriptBlock { iex ((Get-Content '%~f0') -join [Environment]::NewLine) } | Out-Null"
 exit /b
 : end batch / begin powershell #>
 
@@ -303,7 +305,7 @@ function Show-LoginDialog {
         $txt = New-Object System.Windows.Forms.Label
         $txt.Location = "20, 20"
         $txt.Size = "360, 40"
-        $txt.Text = "IITD Proxy Keep-Alive v2.6`nAuthor: Akhil"
+        $txt.Text = "IITD Proxy Keep-Alive v2.4`nAuthor: Akhil"
         $abt.Controls.Add($txt)
 
         $lnk = New-Object System.Windows.Forms.LinkLabel
