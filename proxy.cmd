@@ -4,7 +4,7 @@
 ::   IITD Proxy Keep-Alive Utility
 :: ===========================================================================
 ::   Author:       Akhil A
-::   Version:      2.7
+::   Version:      2.8
 ::   Date:         2025-12-10
 ::   License:      MIT
 ::   Description:  Automates authentication for IIT Delhi Proxy servers.
@@ -446,7 +446,7 @@ if (Connect-ProxySession) {
 $script:notifyIcon = New-Object System.Windows.Forms.NotifyIcon
 $script:notifyIcon.Visible = $true
 Update-TrayStatus "Connected" "Good"
-$script:notifyIcon.ShowBalloonTip(3000, "IITD Proxy", "Proxy Login Successful.`nSystem Tray Active.", [System.Windows.Forms.ToolTipIcon]::Info)
+$script:notifyIcon.ShowBalloonTip(5000, "IITD Proxy", "Proxy Login Successful.`nSystem Tray Active. Right-click to Logout & Exit.", [System.Windows.Forms.ToolTipIcon]::Info)
 
 $script:notifyIcon.add_DoubleClick({ Show-LogViewer })
 
@@ -456,7 +456,7 @@ $menuItemLog.add_Click({ Show-LogViewer })
 
 $contextMenu.MenuItems.Add("-")
 
-$menuItemExit = $contextMenu.MenuItems.Add("Exit")
+$menuItemExit = $contextMenu.MenuItems.Add("Logout & Exit")
 $menuItemExit.add_Click({ 
     Disconnect-ProxySession
     $script:notifyIcon.Visible = $false
