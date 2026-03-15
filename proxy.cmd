@@ -13,6 +13,22 @@
 ::   URL:          https://akhilabburu.github.io/iitd/proxy_persistent.html
 :: ===========================================================================
 
+:: Check PowerShell version (5.1+ required) before doing anything else
+powershell -NoProfile -Command "if($PSVersionTable.PSVersion -lt [Version]'5.1'){exit 1}"
+if %errorlevel% neq 0 (
+    echo ===================================================
+    echo ERROR: PowerShell 5.1 is required.
+    echo Your system has an older version.
+    echo.
+    echo Please install:
+    echo   1. .NET Framework 4.5.2+
+    echo   2. WMF 5.1
+    echo   3. Reboot your PC.
+    echo ===================================================
+    pause
+    exit
+)
+
 :: Check for hidden flag. If not present, launch invisible instance and exit.
 if "%1"=="h" goto :run
 powershell -NoProfile -WindowStyle Hidden -Command "$w=New-Object -ComObject WScript.Shell;$w.Run('cmd /c \""%~f0\"" h',0)"
