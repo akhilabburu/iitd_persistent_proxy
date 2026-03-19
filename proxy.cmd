@@ -321,7 +321,7 @@ function Show-LoginDialog {
         $txt = New-Object System.Windows.Forms.Label
         $txt.Location = "20, 20"
         $txt.Size = "360, 40"
-        $txt.Text = "IITD Proxy Keep-Alive v2.4`nAuthor: Akhil"
+        $txt.Text = "IITD Proxy Keep-Alive v2.8`nAuthor: Akhil"
         $abt.Controls.Add($txt)
 
         $lnk = New-Object System.Windows.Forms.LinkLabel
