@@ -4,8 +4,8 @@
 ::   IITD Proxy Keep-Alive Utility
 :: ===========================================================================
 ::   Author:       Akhil A
-::   Version:      2.8
-::   Date:         2025-12-10
+::   Version:      3.0
+::   Date:         2026-03-26
 ::   License:      MIT
 ::   Description:  Automates authentication for IIT Delhi Proxy servers.
 ::                 Prevents session timeouts and manages system proxy settings.
@@ -35,6 +35,7 @@ powershell -NoProfile -WindowStyle Hidden -Command "$w=New-Object -ComObject WSc
 exit
 
 :run
+set SCRIPT_SELF_PATH=%~f0
 title IITD Proxy Keep-Alive
 cd /d %~dp0
 :: Load the PowerShell portion below using Invoke-Expression
@@ -67,6 +68,9 @@ $script:Config = @{
     MaxLogLines       = 2000
     UserAgent         = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Gecko/20100101 Firefox/141.0"
 }
+
+$script:StartupRegPath = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Run"
+$script:StartupRegName = "IITDProxy"
 
 # IITD Proxy mapping (Category -> Server Port)
 $script:ProxyMap = @{
@@ -118,16 +122,71 @@ function Write-Log {
 }
 
 function Import-ProxyConfig {
-    if (Test-Path $script:Config.ConfigFile) { 
-        try { Get-Content $script:Config.ConfigFile -Force -Raw | ConvertFrom-Json } catch { $null } 
+    if (-not (Test-Path $script:Config.ConfigFile)) { return $null }
+    try {
+        $data = Get-Content $script:Config.ConfigFile -Force -Raw | ConvertFrom-Json
+
+        # Decrypt password if present
+        $plainPass = $null
+        if ($data.Password) {
+            try {
+                $secure   = ConvertTo-SecureString $data.Password   # DPAPI decrypt
+                $plainPass = [System.Net.NetworkCredential]::new("", $secure).Password
+            } catch {
+                Write-Log "Could not decrypt saved password (wrong user/machine?)" "WARN"
+            }
+        }
+
+        return @{
+            Username       = $data.Username
+            Category       = $data.Category
+            Password       = $plainPass
+            AutoLogin      = [bool]$data.AutoLogin
+            StartOnStartup = [bool]$data.StartOnStartup
+            UpdateSysProxy = $(if ($null -eq $data.UpdateSysProxy) { $true } else { [bool]$data.UpdateSysProxy })
+        }
+    } catch {
+        Write-Log "Config read error: $($_.Exception.Message)" "WARN"
+        return $null
     }
 }
 
 function Export-ProxyConfig {
-    param($User, $Category)
-    @{ Username=$User; Category=$Category } | ConvertTo-Json | Set-Content $script:Config.ConfigFile -Force
+    param($User, $Pass, $Category, $AutoLogin, $StartOnStartup, $UpdateSys)
+
+    $encPass = $null
+    if ($Pass) {
+        # DPAPI: encrypted blob is tied to current Windows user account on this machine
+        $encPass = ConvertFrom-SecureString (ConvertTo-SecureString $Pass -AsPlainText -Force)
+    }
+
+    @{
+        Username        = $User
+        Category        = $Category
+        Password        = $encPass
+        AutoLogin       = $AutoLogin
+        StartOnStartup  = $StartOnStartup
+        UpdateSysProxy  = $UpdateSys
+    } | ConvertTo-Json | Set-Content $script:Config.ConfigFile -Force
+
     # Hide the config file so users don't accidentally delete it
     try { (Get-Item $script:Config.ConfigFile -Force).Attributes = "Hidden" } catch {}
+}
+
+function Set-StartupEntry {
+    $target = if ($env:SCRIPT_SELF_PATH) { $env:SCRIPT_SELF_PATH } else { $MyInvocation.ScriptName }
+    $value  = "`"cmd.exe`" /c `"`"$target`"`""
+    Set-ItemProperty -Path $script:StartupRegPath -Name $script:StartupRegName -Value $value
+    Write-Log "Startup entry added to registry" "SYSTEM"
+}
+
+function Remove-StartupEntry {
+    Remove-ItemProperty -Path $script:StartupRegPath -Name $script:StartupRegName -ErrorAction SilentlyContinue
+    Write-Log "Startup entry removed from registry" "SYSTEM"
+}
+
+function Test-StartupEntry {
+    return (Get-ItemProperty -Path $script:StartupRegPath -Name $script:StartupRegName -ErrorAction SilentlyContinue) -ne $null
 }
 
 # ==========================================
@@ -294,7 +353,7 @@ function Show-LoginDialog {
     
     $form = New-Object System.Windows.Forms.Form
     $form.Text = "IITD Proxy Login"
-    $form.Size = New-Object System.Drawing.Size(320, 350)
+    $form.Size = New-Object System.Drawing.Size(320, 395)
     $form.StartPosition = "CenterScreen"
     $form.FormBorderStyle = 'FixedSingle'
     $form.MaximizeBox = $false
@@ -321,7 +380,7 @@ function Show-LoginDialog {
         $txt = New-Object System.Windows.Forms.Label
         $txt.Location = "20, 20"
         $txt.Size = "360, 40"
-        $txt.Text = "IITD Proxy Keep-Alive v2.8`nAuthor: Akhil"
+        $txt.Text = "IITD Proxy Keep-Alive v3.0`nAuthor: Akhil"
         $abt.Controls.Add($txt)
 
         $lnk = New-Object System.Windows.Forms.LinkLabel
@@ -365,11 +424,25 @@ function Show-LoginDialog {
 
     $chkSystemProxy = New-Object System.Windows.Forms.CheckBox; $chkSystemProxy.Location = "10, 200"; $chkSystemProxy.Size = "290, 20"; $chkSystemProxy.Text = "Update Windows Proxy Settings"; $chkSystemProxy.Checked = $true; $form.Controls.Add($chkSystemProxy)
 
+    $chkAutoLogin = New-Object System.Windows.Forms.CheckBox
+    $chkAutoLogin.Location = "10, 225"
+    $chkAutoLogin.Size     = "290, 20"
+    $chkAutoLogin.Text     = "Auto-login on next launch (saves password securely)"
+    $chkAutoLogin.Checked  = ($SavedConfig -and $SavedConfig.AutoLogin)
+    $form.Controls.Add($chkAutoLogin)
+
+    $chkStartup = New-Object System.Windows.Forms.CheckBox
+    $chkStartup.Location = "10, 248"
+    $chkStartup.Size     = "290, 20"
+    $chkStartup.Text     = "Start automatically on Windows login"
+    $chkStartup.Checked  = (Test-StartupEntry)
+    $form.Controls.Add($chkStartup)
+
     # Buttons
-    $btnLogin = New-Object System.Windows.Forms.Button; $btnLogin.Location = "110, 235"; $btnLogin.Size = "80, 30"; $btnLogin.Text = "Login"
+    $btnLogin = New-Object System.Windows.Forms.Button; $btnLogin.Location = "110, 280"; $btnLogin.Size = "80, 30"; $btnLogin.Text = "Login"
     $form.Controls.Add($btnLogin)
     
-    $btnCancel = New-Object System.Windows.Forms.Button; $btnCancel.Location = "200, 235"; $btnCancel.Size = "80, 30"; $btnCancel.Text = "Cancel"
+    $btnCancel = New-Object System.Windows.Forms.Button; $btnCancel.Location = "200, 280"; $btnCancel.Size = "80, 30"; $btnCancel.Text = "Cancel"
     $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
     $form.Controls.Add($btnCancel)
 
@@ -379,14 +452,30 @@ function Show-LoginDialog {
     $script:guiResult = $null
     $btnLogin.Add_Click({
         if ($txtUser.Text -and $txtPass.Text -and $cbCategory.SelectedItem) {
-            $script:guiResult = @{ User=$txtUser.Text.Trim(); Pass=$txtPass.Text; Cat=$cbCategory.SelectedItem; UpdateSys=$chkSystemProxy.Checked }
-            
+            $script:guiResult = @{
+                User           = $txtUser.Text.Trim()
+                Pass           = $txtPass.Text
+                Cat            = $cbCategory.SelectedItem
+                UpdateSys      = $chkSystemProxy.Checked
+                AutoLogin      = $chkAutoLogin.Checked
+                StartOnStartup = $chkStartup.Checked
+            }
+
             # Handle config persistence based on user choice
-            if ($chkSave.Checked) {
-                Export-ProxyConfig -User $script:guiResult.User -Category $script:guiResult.Cat
+            if ($chkSave.Checked -or $chkAutoLogin.Checked) {
+                Export-ProxyConfig `
+                    -User           $script:guiResult.User `
+                    -Pass           $(if ($chkAutoLogin.Checked) { $script:guiResult.Pass } else { $null }) `
+                    -Category       $script:guiResult.Cat `
+                    -AutoLogin      $chkAutoLogin.Checked `
+                    -StartOnStartup $chkStartup.Checked `
+                    -UpdateSys      $chkSystemProxy.Checked
             } else {
                 if (Test-Path $script:Config.ConfigFile) { Remove-Item $script:Config.ConfigFile -Force -ErrorAction SilentlyContinue }
             }
+
+            # Startup registration
+            if ($chkStartup.Checked) { Set-StartupEntry } else { Remove-StartupEntry }
 
             $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
             $form.Close()
@@ -434,9 +523,24 @@ function Show-LogViewer {
 $script:iconGood = Create-StatusIcon -Color ([System.Drawing.Color]::LimeGreen) -Shape "Circle"
 $script:iconBad  = Create-StatusIcon -Color ([System.Drawing.Color]::Red) -Shape "Octagon"
 
-# Load Config & Show GUI
+# Load Config
 $saved = Import-ProxyConfig
-$script:creds = Show-LoginDialog -SavedConfig $saved
+
+# Auto-login path: skip GUI entirely if creds are fully saved
+$didAutoLogin = $false
+if ($saved -and $saved.AutoLogin -and $saved.Password -and $saved.Username -and $saved.Category) {
+    Write-Log "Auto-login: using saved credentials for $($saved.Username)" "INFO"
+    $script:creds = @{
+        User      = $saved.Username
+        Pass      = $saved.Password
+        Cat       = $saved.Category
+        UpdateSys = $saved.UpdateSysProxy
+    }
+    $didAutoLogin = $true
+} else {
+    # Normal login path
+    $script:creds = Show-LoginDialog -SavedConfig $saved
+}
 
 if (-not $script:creds) { exit }
 
@@ -449,13 +553,31 @@ if ($script:creds.UpdateSys) {
 Initialize-ProxyEnvironment -Category $script:creds.Cat
 
 if (Connect-ProxySession) {
-    Write-Log "Initial Login Successful as $($script:creds.User)" "SUCCESS"
+    Write-Log "Login Successful as $($script:creds.User)$(if($didAutoLogin){' [auto]'})" "SUCCESS"
 } else {
-    $lastLog = $global:logHistory.ToString().Trim()
-    $lastLines = $lastLog -split "`r`n"
-    $errorReason = if ($lastLines) { $lastLines[-1] } else { "Unknown Error" }
-    [System.Windows.Forms.MessageBox]::Show("Login Failed.`n$errorReason", "Error")
-    exit
+    # Auto-login failed -> fall back to manual login dialog
+    if ($didAutoLogin) {
+        Write-Log "Auto-login failed, falling back to manual login" "WARN"
+        $script:creds = Show-LoginDialog -SavedConfig $saved
+        if (-not $script:creds) { exit }
+        if ($script:creds.UpdateSys) {
+            Initialize-SystemProxy -Category $script:creds.Cat
+        }
+        Initialize-ProxyEnvironment -Category $script:creds.Cat
+        if (-not (Connect-ProxySession)) {
+            $lastLog = $global:logHistory.ToString().Trim()
+            $lastLines = $lastLog -split "`r`n"
+            $errorReason = $(if ($lastLines) { $lastLines[-1] } else { "Unknown Error" })
+            [System.Windows.Forms.MessageBox]::Show("Login Failed.`n$errorReason", "Error")
+            exit
+        }
+    } else {
+        $lastLog = $global:logHistory.ToString().Trim()
+        $lastLines = $lastLog -split "`r`n"
+        $errorReason = $(if ($lastLines) { $lastLines[-1] } else { "Unknown Error" })
+        [System.Windows.Forms.MessageBox]::Show("Login Failed.`n$errorReason", "Error")
+        exit
+    }
 }
 
 # Setup Tray Icon
