@@ -4,8 +4,8 @@
 ::   IITD Proxy Keep-Alive Utility
 :: ===========================================================================
 ::   Author:       Akhil A
-::   Version:      3.0
-::   Date:         2026-03-26
+::   Version:      3.1
+::   Date:         2026-05-02
 ::   License:      MIT
 ::   Description:  Automates authentication for IIT Delhi Proxy servers.
 ::                 Prevents session timeouts and manages system proxy settings.
@@ -45,6 +45,24 @@ exit /b
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
+
+# ==========================================
+# TLS HARDENING
+# ==========================================
+# PS 5.1 on stock Win10 defaults to TLS 1.0/1.1 which IITD/Google may reject.
+# Tls12 has shipped since .NET 4.5; Tls13 only on 4.8+, so guard both.
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12 } catch {}
+try { [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls13 } catch {}
+
+# ==========================================
+# SINGLE-INSTANCE GUARD
+# ==========================================
+# Per-user lock: prevents accidental dual launches. The batch hidden-relauncher
+# above means a stray double-click would otherwise spawn two tray icons + timers.
+$script:mutexCreated = $false
+# Use ::new() rather than New-Object so the [ref] (out bool) binds reliably
+$script:mutex = [System.Threading.Mutex]::new($true, "Local\IITDProxyKeepAlive", [ref]$script:mutexCreated)
+if (-not $script:mutexCreated) { exit }
 
 # ==========================================
 # CONFIGURATION & WININET INTEROP
@@ -99,24 +117,47 @@ $script:iconNeutral  = [System.Drawing.Icon]::ExtractAssociatedIcon($PSHOME + "\
 # ==========================================
 # LOGGING & IO
 # ==========================================
+function Get-LogColor {
+    param([string]$Type)
+    switch ($Type) {
+        "ERROR"   { return [System.Drawing.Color]::FromArgb(200,  35,  35) }
+        "WARN"    { return [System.Drawing.Color]::FromArgb(180, 100,   0) }
+        "SERVER"  { return [System.Drawing.Color]::FromArgb(160,  20,  80) }
+        "SUCCESS" { return [System.Drawing.Color]::FromArgb(  0, 130,  50) }
+        "SYSTEM"  { return [System.Drawing.Color]::FromArgb(  0,  90, 160) }
+        default   { return [System.Drawing.Color]::Black }
+    }
+}
+
+function Append-LogLine {
+    # Appends one line to the RichTextBox in $Type's color. Caller is on UI thread.
+    param($Rtb, [string]$Line, [string]$Type)
+    $start = $Rtb.TextLength
+    $Rtb.AppendText($Line + "`r`n")
+    $Rtb.Select($start, $Line.Length)
+    $Rtb.SelectionColor = Get-LogColor $Type
+    $Rtb.Select($Rtb.TextLength, 0)
+    $Rtb.SelectionColor = [System.Drawing.Color]::Black
+    $Rtb.ScrollToCaret()
+}
+
 function Write-Log {
     param($Msg, $Type="INFO")
     $timestamp = Get-Date -Format "HH:mm:ss"
     $line = "[$timestamp] [$Type] $Msg"
-    
+
     # Simple circular buffer logic to prevent memory bloat
     if ($global:logHistory.Length -gt 50000) {
         $global:logHistory.Remove(0, 10000) | Out-Null
     }
-
     $global:logHistory.AppendLine($line) | Out-Null
-    
-    # Thread-safe UI update
+
+    # Thread-safe UI update with color
     if ($script:txtLogBox -and -not $script:txtLogBox.IsDisposed) {
         if ($script:txtLogBox.InvokeRequired) {
-            $script:txtLogBox.Invoke([Action]{ $script:txtLogBox.AppendText($line + "`r`n") })
+            $script:txtLogBox.Invoke([Action]{ Append-LogLine $script:txtLogBox $line $Type }) | Out-Null
         } else {
-            $script:txtLogBox.AppendText($line + "`r`n")
+            Append-LogLine $script:txtLogBox $line $Type
         }
     }
 }
@@ -173,6 +214,29 @@ function Export-ProxyConfig {
     try { (Get-Item $script:Config.ConfigFile -Force).Attributes = "Hidden" } catch {}
 }
 
+function Clear-SavedPassword {
+    # Called when an auto-login attempt with the saved DPAPI password fails
+    # (typically because the user changed their IITD password). Wipes the
+    # password + AutoLogin flag while keeping username/category/preferences,
+    # so the next manual login can re-save a working password cleanly.
+    if (-not (Test-Path $script:Config.ConfigFile)) { return }
+    try {
+        $data = Get-Content $script:Config.ConfigFile -Force -Raw | ConvertFrom-Json
+        @{
+            Username        = $data.Username
+            Category        = $data.Category
+            Password        = $null
+            AutoLogin       = $false
+            StartOnStartup  = [bool]$data.StartOnStartup
+            UpdateSysProxy  = $(if ($null -eq $data.UpdateSysProxy) { $true } else { [bool]$data.UpdateSysProxy })
+        } | ConvertTo-Json | Set-Content $script:Config.ConfigFile -Force
+        try { (Get-Item $script:Config.ConfigFile -Force).Attributes = "Hidden" } catch {}
+        Write-Log "Saved password cleared (auto-login rejected)" "WARN"
+    } catch {
+        Write-Log "Could not clear saved password: $($_.Exception.Message)" "WARN"
+    }
+}
+
 function Set-StartupEntry {
     $target = if ($env:SCRIPT_SELF_PATH) { $env:SCRIPT_SELF_PATH } else { $MyInvocation.ScriptName }
     $value  = "`"cmd.exe`" /c `"`"$target`"`""
@@ -192,27 +256,53 @@ function Test-StartupEntry {
 # ==========================================
 # GRAPHICS & HEALTH CHECKS
 # ==========================================
-# Generates dynamic tray icons using GDI+ to avoid external asset dependencies
-function Create-StatusIcon {
+# Generates dynamic tray icons using GDI+ to avoid external asset dependencies.
+# Rendered at 32x32 with high-quality AA so Windows can downscale crisply on
+# both standard (16px) and high-DPI (24/32px) taskbars. A glyph is drawn inside
+# the shape so status is readable at a glance, not just by colour.
+function New-StatusIcon {
     param([System.Drawing.Color]$Color, [string]$Shape)
-    $size = 16
-    $bmp = New-Object System.Drawing.Bitmap $size, $size
-    $g = [System.Drawing.Graphics]::FromImage($bmp)
-    $g.SmoothingMode = "AntiAlias"
+    $size = 32
+    $bmp  = New-Object System.Drawing.Bitmap $size, $size
+    $g    = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode     = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.PixelOffsetMode   = [System.Drawing.Drawing2D.PixelOffsetMode]::HighQuality
+    $g.InterpolationMode = [System.Drawing.Drawing2D.InterpolationMode]::HighQualityBicubic
+
     $brush = New-Object System.Drawing.SolidBrush $Color
-    
+
     if ($Shape -eq "Circle") {
-        $g.FillEllipse($brush, 1, 1, $size-2, $size-2)
+        # Filled circle + white check mark
+        $g.FillEllipse($brush, 1, 1, $size - 2, $size - 2)
+        $pen = New-Object System.Drawing.Pen ([System.Drawing.Color]::White), 4
+        $pen.StartCap = [System.Drawing.Drawing2D.LineCap]::Round
+        $pen.EndCap   = [System.Drawing.Drawing2D.LineCap]::Round
+        $g.DrawLines($pen, [System.Drawing.Point[]]@(
+            (New-Object System.Drawing.Point 8, 17),
+            (New-Object System.Drawing.Point 14, 23),
+            (New-Object System.Drawing.Point 24, 10)
+        ))
+        $pen.Dispose()
     } else {
-        # Draw Octagon manually
-        $p = @(
-            (New-Object System.Drawing.Point 5,0), (New-Object System.Drawing.Point 10,0),
-            (New-Object System.Drawing.Point 15,5), (New-Object System.Drawing.Point 15,10),
-            (New-Object System.Drawing.Point 10,15), (New-Object System.Drawing.Point 5,15),
-            (New-Object System.Drawing.Point 0,10), (New-Object System.Drawing.Point 0,5)
-        )
-        $g.FillPolygon($brush, $p)
+        # Stop-sign octagon + white exclamation mark
+        $o = 9
+        $g.FillPolygon($brush, [System.Drawing.Point[]]@(
+            (New-Object System.Drawing.Point $o,         0),
+            (New-Object System.Drawing.Point ($size-$o), 0),
+            (New-Object System.Drawing.Point ($size-1),  $o),
+            (New-Object System.Drawing.Point ($size-1),  ($size-$o)),
+            (New-Object System.Drawing.Point ($size-$o), ($size-1)),
+            (New-Object System.Drawing.Point $o,         ($size-1)),
+            (New-Object System.Drawing.Point 0,          ($size-$o)),
+            (New-Object System.Drawing.Point 0,          $o)
+        ))
+        $whiteBrush = New-Object System.Drawing.SolidBrush ([System.Drawing.Color]::White)
+        $g.FillRectangle($whiteBrush, 14, 7, 4, 13)
+        $g.FillEllipse($whiteBrush, 13, 23, 6, 6)
+        $whiteBrush.Dispose()
     }
+
+    $brush.Dispose()
     $g.Dispose()
     return [System.Drawing.Icon]::FromHandle($bmp.GetHicon())
 }
@@ -252,19 +342,55 @@ function Initialize-ProxyEnvironment {
     Write-Log "Target set to: Proxy$pNum ($Category)"
 }
 
+$script:OriginalAutoConfigURL    = $null
+$script:OriginalAutoConfigURLSet = $false   # was the value present before we touched it?
+$script:SnapshotTaken            = $false
+
+function Save-OriginalSystemProxy {
+    if ($script:SnapshotTaken) { return }
+    $regKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+    $existing = Get-ItemProperty -Path $regKey -Name AutoConfigURL -ErrorAction SilentlyContinue
+    if ($existing -and $existing.AutoConfigURL) {
+        $script:OriginalAutoConfigURL    = $existing.AutoConfigURL
+        $script:OriginalAutoConfigURLSet = $true
+    } else {
+        $script:OriginalAutoConfigURLSet = $false
+    }
+    $script:SnapshotTaken = $true
+}
+
 function Initialize-SystemProxy {
     param($Category)
     try {
+        Save-OriginalSystemProxy
         $pacUrl = "http://www.cc.iitd.ac.in/cgi-bin/proxy.$Category"
         $regKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
         Set-ItemProperty -Path $regKey -Name AutoConfigURL -Value $pacUrl
-        
+
         # Force Windows to refresh connection settings immediately
         $wininet::InternetSetOption([IntPtr]::Zero, $script:Constants.INTERNET_OPTION_SETTINGS_CHANGED, [IntPtr]::Zero, 0)
         $wininet::InternetSetOption([IntPtr]::Zero, $script:Constants.INTERNET_OPTION_REFRESH, [IntPtr]::Zero, 0)
         Write-Log "Windows System Proxy updated to: $pacUrl" "SYSTEM"
     } catch {
         Write-Log "Failed to set Windows Proxy: $($_.Exception.Message)" "ERROR"
+    }
+}
+
+function Restore-SystemProxy {
+    if (-not $script:SnapshotTaken) { return }
+    try {
+        $regKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Internet Settings"
+        if ($script:OriginalAutoConfigURLSet) {
+            Set-ItemProperty -Path $regKey -Name AutoConfigURL -Value $script:OriginalAutoConfigURL
+            Write-Log "Windows System Proxy restored to: $($script:OriginalAutoConfigURL)" "SYSTEM"
+        } else {
+            Remove-ItemProperty -Path $regKey -Name AutoConfigURL -ErrorAction SilentlyContinue
+            Write-Log "Windows System Proxy cleared (was not set before launch)" "SYSTEM"
+        }
+        $wininet::InternetSetOption([IntPtr]::Zero, $script:Constants.INTERNET_OPTION_SETTINGS_CHANGED, [IntPtr]::Zero, 0)
+        $wininet::InternetSetOption([IntPtr]::Zero, $script:Constants.INTERNET_OPTION_REFRESH, [IntPtr]::Zero, 0)
+    } catch {
+        Write-Log "Failed to restore Windows Proxy: $($_.Exception.Message)" "ERROR"
     }
 }
 
@@ -350,101 +476,200 @@ function Send-KeepAlive {
 function Show-LoginDialog {
     param($SavedConfig)
     [System.Windows.Forms.Application]::EnableVisualStyles()
-    
+
+    $segoe = New-Object System.Drawing.Font("Segoe UI", 9)
+
     $form = New-Object System.Windows.Forms.Form
-    $form.Text = "IITD Proxy Login"
-    $form.Size = New-Object System.Drawing.Size(320, 395)
-    $form.StartPosition = "CenterScreen"
-    $form.FormBorderStyle = 'FixedSingle'
-    $form.MaximizeBox = $false
-    $form.TopMost = $true 
+    $form.Text                = "IITD Proxy Login"
+    $form.Font                = $segoe
+    $form.StartPosition       = "CenterScreen"
+    $form.FormBorderStyle     = 'FixedSingle'
+    $form.MaximizeBox         = $false
+    $form.MinimizeBox         = $false
+    $form.AutoSize            = $true
+    $form.AutoSizeMode        = [System.Windows.Forms.AutoSizeMode]::GrowAndShrink
+    $form.AutoScaleMode       = [System.Windows.Forms.AutoScaleMode]::Dpi
+    $form.AutoScaleDimensions = New-Object System.Drawing.SizeF(96, 96)
+    $form.TopMost             = $true
+    $form.Padding             = New-Object System.Windows.Forms.Padding(12)
+    $form.Icon                = [System.Drawing.Icon]::ExtractAssociatedIcon($PSHOME + "\powershell.exe")
 
-    # Version/About Label
-    $lblVer = New-Object System.Windows.Forms.Label
-    $lblVer.Text = "?"
-    $lblVer.Font = New-Object System.Drawing.Font("Consolas", 10, [System.Drawing.FontStyle]::Bold)
-    $lblVer.ForeColor = [System.Drawing.Color]::Gray
-    $lblVer.Cursor = [System.Windows.Forms.Cursors]::Hand
-    $lblVer.Location = "290, 5"
-    $lblVer.Size = "20, 20"
-    
-    # CLICKABLE ABOUT BOX WITH LINK
-    $lblVer.Add_Click({ 
-        $abt = New-Object System.Windows.Forms.Form
-        $abt.Text = "About"
-        $abt.Size = New-Object System.Drawing.Size(420, 180)
-        $abt.StartPosition = "CenterScreen"
-        $abt.FormBorderStyle = 'FixedToolWindow'
-        $abt.TopMost = $true # Ensures it sits ON TOP of the Login Window
+    # Outer 1-column TableLayoutPanel: rows are added in document order
+    $tlp = New-Object System.Windows.Forms.TableLayoutPanel
+    $tlp.Dock         = 'Fill'
+    $tlp.ColumnCount  = 1
+    $tlp.AutoSize     = $true
+    $tlp.AutoSizeMode = 'GrowAndShrink'
+    [void]$tlp.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    $form.Controls.Add($tlp)
 
-        $txt = New-Object System.Windows.Forms.Label
-        $txt.Location = "20, 20"
-        $txt.Size = "360, 40"
-        $txt.Text = "IITD Proxy Keep-Alive v3.0`nAuthor: Akhil"
-        $abt.Controls.Add($txt)
+    $addPair = {
+        param($labelText, $control)
+        $lbl = New-Object System.Windows.Forms.Label
+        $lbl.Text = $labelText
+        $lbl.AutoSize = $true
+        $lbl.Margin = New-Object System.Windows.Forms.Padding(2, 6, 2, 0)
+        [void]$tlp.Controls.Add($lbl)
 
-        $lnk = New-Object System.Windows.Forms.LinkLabel
-        $lnk.Location = "20, 60"
-        $lnk.Size = "360, 20"
-        $lnk.Text = "https://akhilabburu.github.io/iitd/proxy_persistent.html"
-        $lnk.LinkColor = [System.Drawing.Color]::Blue
-        $lnk.Add_Click({ [System.Diagnostics.Process]::Start("https://akhilabburu.github.io/iitd/proxy_persistent.html") })
-        $abt.Controls.Add($lnk)
+        $control.Margin = New-Object System.Windows.Forms.Padding(2, 2, 2, 6)
+        $control.Width  = 280
+        [void]$tlp.Controls.Add($control)
+    }
 
-        $btn = New-Object System.Windows.Forms.Button
-        $btn.Location = "160, 100"
-        $btn.Text = "OK"
-        $btn.DialogResult = "OK"
-        $abt.Controls.Add($btn)
-        $abt.AcceptButton = $btn
-
-        $abt.ShowDialog()
-    })
-    $form.Controls.Add($lblVer)
-
-    # Input Fields
-    $lblCat = New-Object System.Windows.Forms.Label; $lblCat.Location = "10, 15"; $lblCat.Size = "280, 20"; $lblCat.Text = "Category:"; $form.Controls.Add($lblCat)
-    
-    $cbCategory = New-Object System.Windows.Forms.ComboBox; $cbCategory.Location = "10, 35"; $cbCategory.Size = "280, 21"; $cbCategory.DropDownStyle = "DropDownList"
+    # Category
+    $cbCategory = New-Object System.Windows.Forms.ComboBox
+    $cbCategory.DropDownStyle = "DropDownList"
     $script:ProxyMap.Keys | Sort-Object | ForEach-Object { [void]$cbCategory.Items.Add($_) }
     if ($SavedConfig -and $script:ProxyMap.ContainsKey($SavedConfig.Category)) { $cbCategory.SelectedItem = $SavedConfig.Category }
     elseif ($cbCategory.Items.Count -gt 0) { $cbCategory.SelectedIndex = 0 }
-    $form.Controls.Add($cbCategory)
+    & $addPair "Category:" $cbCategory
 
-    $lblUser = New-Object System.Windows.Forms.Label; $lblUser.Location = "10, 70"; $lblUser.Size = "280, 20"; $lblUser.Text = "Username:"; $form.Controls.Add($lblUser)
-    $txtUser = New-Object System.Windows.Forms.TextBox; $txtUser.Location = "10, 90"; $txtUser.Size = "280, 20"; if ($SavedConfig) { $txtUser.Text = $SavedConfig.Username }; $form.Controls.Add($txtUser)
+    # Username
+    $txtUser = New-Object System.Windows.Forms.TextBox
+    if ($SavedConfig) { $txtUser.Text = $SavedConfig.Username }
+    & $addPair "Username:" $txtUser
 
-    $lblPass = New-Object System.Windows.Forms.Label; $lblPass.Location = "10, 125"; $lblPass.Size = "280, 20"; $lblPass.Text = "Password:"; $form.Controls.Add($lblPass)
-    $txtPass = New-Object System.Windows.Forms.TextBox; $txtPass.Location = "10, 145"; $txtPass.Size = "280, 20"; $txtPass.PasswordChar = '*'; $form.Controls.Add($txtPass)
+    # Password (system bullet glyph instead of plain '*')
+    $txtPass = New-Object System.Windows.Forms.TextBox
+    $txtPass.UseSystemPasswordChar = $true
+    & $addPair "Password:" $txtPass
 
-    # Options
-    $chkSave = New-Object System.Windows.Forms.CheckBox; $chkSave.Location = "10, 175"; $chkSave.Size = "290, 20"; $chkSave.Text = "Remember my Category and Username"; 
-    $chkSave.Checked = ($SavedConfig -ne $null); # Auto-check if config existed
-    $form.Controls.Add($chkSave)
+    # Options group
+    $grp = New-Object System.Windows.Forms.GroupBox
+    $grp.Text         = "Options"
+    $grp.AutoSize     = $true
+    $grp.AutoSizeMode = 'GrowAndShrink'
+    $grp.Padding      = New-Object System.Windows.Forms.Padding(8, 4, 8, 8)
+    $grp.Margin       = New-Object System.Windows.Forms.Padding(2, 8, 2, 8)
+    $grp.Width        = 280   # match textbox width above so right edges align
 
-    $chkSystemProxy = New-Object System.Windows.Forms.CheckBox; $chkSystemProxy.Location = "10, 200"; $chkSystemProxy.Size = "290, 20"; $chkSystemProxy.Text = "Update Windows Proxy Settings"; $chkSystemProxy.Checked = $true; $form.Controls.Add($chkSystemProxy)
+    $flow = New-Object System.Windows.Forms.FlowLayoutPanel
+    $flow.Dock          = 'Fill'
+    $flow.FlowDirection = 'TopDown'
+    $flow.WrapContents  = $false
+    $flow.AutoSize      = $true
+    $flow.AutoSizeMode  = 'GrowAndShrink'
+    $grp.Controls.Add($flow)
+
+    $chkSave = New-Object System.Windows.Forms.CheckBox
+    $chkSave.Text     = "Remember category and username"
+    $chkSave.AutoSize = $true
+    $chkSave.Checked  = ($null -ne $SavedConfig)
+    $flow.Controls.Add($chkSave)
+
+    $chkSystemProxy = New-Object System.Windows.Forms.CheckBox
+    $chkSystemProxy.Text     = "Update Windows Proxy settings"
+    $chkSystemProxy.AutoSize = $true
+    $chkSystemProxy.Checked  = $(if ($SavedConfig) { $SavedConfig.UpdateSysProxy } else { $true })
+    $flow.Controls.Add($chkSystemProxy)
 
     $chkAutoLogin = New-Object System.Windows.Forms.CheckBox
-    $chkAutoLogin.Location = "10, 225"
-    $chkAutoLogin.Size     = "290, 20"
-    $chkAutoLogin.Text     = "Auto-login on next launch (saves password securely)"
+    $chkAutoLogin.Text     = "Auto-login on next launch"
+    $chkAutoLogin.AutoSize = $true
     $chkAutoLogin.Checked  = ($SavedConfig -and $SavedConfig.AutoLogin)
-    $form.Controls.Add($chkAutoLogin)
+    $flow.Controls.Add($chkAutoLogin)
 
     $chkStartup = New-Object System.Windows.Forms.CheckBox
-    $chkStartup.Location = "10, 248"
-    $chkStartup.Size     = "290, 20"
-    $chkStartup.Text     = "Start automatically on Windows login"
+    $chkStartup.Text     = "Start on Windows login"
+    $chkStartup.AutoSize = $true
     $chkStartup.Checked  = (Test-StartupEntry)
-    $form.Controls.Add($chkStartup)
+    $flow.Controls.Add($chkStartup)
 
-    # Buttons
-    $btnLogin = New-Object System.Windows.Forms.Button; $btnLogin.Location = "110, 280"; $btnLogin.Size = "80, 30"; $btnLogin.Text = "Login"
-    $form.Controls.Add($btnLogin)
-    
-    $btnCancel = New-Object System.Windows.Forms.Button; $btnCancel.Location = "200, 280"; $btnCancel.Size = "80, 30"; $btnCancel.Text = "Cancel"
+    [void]$tlp.Controls.Add($grp)
+
+    # Tooltips on every input - explains the "what" and "why" without crowding the form
+    $tt = New-Object System.Windows.Forms.ToolTip
+    $tt.AutoPopDelay = 12000
+    $tt.InitialDelay = 400
+    $tt.ReshowDelay  = 200
+    $tt.SetToolTip($cbCategory,    "Your IITD account category. Selects which proxy server is used.")
+    $tt.SetToolTip($txtUser,       "Your IITD LDAP/Kerberos username (without @iitd.ac.in).")
+    $tt.SetToolTip($txtPass,       "Your IITD password. Stored encrypted with Windows DPAPI only if you tick Auto-login.")
+    $tt.SetToolTip($chkSave,       "Remember category and username (not the password) for next launch.")
+    $tt.SetToolTip($chkSystemProxy,"Configure Windows so all browsers route through the IITD proxy. Restored when you choose Logout && Exit.")
+    $tt.SetToolTip($chkAutoLogin,  "Save your password (encrypted per Windows user via DPAPI) and skip this dialog on future launches.")
+    $tt.SetToolTip($chkStartup,    "Run this app automatically when you sign in to Windows.")
+
+    # Bottom row: About link (left) | spacer | Login + Cancel (right)
+    $btnRow = New-Object System.Windows.Forms.TableLayoutPanel
+    $btnRow.ColumnCount  = 3
+    $btnRow.RowCount     = 1
+    $btnRow.Dock         = 'Fill'
+    $btnRow.AutoSize     = $true
+    $btnRow.AutoSizeMode = 'GrowAndShrink'
+    $btnRow.Margin       = New-Object System.Windows.Forms.Padding(0, 4, 0, 0)
+    [void]$btnRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+    [void]$btnRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::Percent, 100)))
+    [void]$btnRow.ColumnStyles.Add((New-Object System.Windows.Forms.ColumnStyle([System.Windows.Forms.SizeType]::AutoSize)))
+
+    $btnAbout = New-Object System.Windows.Forms.Button
+    $btnAbout.Text   = "&About"
+    $btnAbout.Width  = 80
+    $btnAbout.Height = 28
+    $btnAbout.Margin = New-Object System.Windows.Forms.Padding(0)
+    $btnAbout.add_Click({
+        $abt = New-Object System.Windows.Forms.Form
+        $abt.Text            = "About"
+        $abt.Font            = $segoe
+        $abt.ClientSize      = New-Object System.Drawing.Size(420, 150)
+        $abt.StartPosition   = "CenterParent"
+        $abt.FormBorderStyle = 'FixedToolWindow'
+        $abt.TopMost         = $true
+        $abt.MaximizeBox     = $false
+        $abt.MinimizeBox     = $false
+
+        $txt = New-Object System.Windows.Forms.Label
+        $txt.Location = New-Object System.Drawing.Point(20, 20)
+        $txt.Size     = New-Object System.Drawing.Size(380, 40)
+        $txt.Text     = "IITD Proxy Keep-Alive v3.1`r`nAuthor: Akhil"
+        $abt.Controls.Add($txt)
+
+        $lnk = New-Object System.Windows.Forms.LinkLabel
+        $lnk.Location = New-Object System.Drawing.Point(20, 60)
+        $lnk.Size     = New-Object System.Drawing.Size(380, 20)
+        $lnk.Text     = "https://akhilabburu.github.io/iitd/proxy_persistent.html"
+        $lnk.add_LinkClicked({ [System.Diagnostics.Process]::Start("https://akhilabburu.github.io/iitd/proxy_persistent.html") | Out-Null })
+        $abt.Controls.Add($lnk)
+
+        $btnAbtOk = New-Object System.Windows.Forms.Button
+        $btnAbtOk.Text         = "OK"
+        $btnAbtOk.DialogResult = "OK"
+        $btnAbtOk.Location     = New-Object System.Drawing.Point(170, 100)
+        $abt.Controls.Add($btnAbtOk)
+        $abt.AcceptButton = $btnAbtOk
+
+        $abt.ShowDialog($form) | Out-Null
+    })
+    [void]$btnRow.Controls.Add($btnAbout, 0, 0)
+
+    # Spacer to push buttons to the right
+    $spacer = New-Object System.Windows.Forms.Label
+    $spacer.AutoSize = $false
+    $spacer.Width    = 1
+    [void]$btnRow.Controls.Add($spacer, 1, 0)
+
+    $btnPanel = New-Object System.Windows.Forms.FlowLayoutPanel
+    $btnPanel.FlowDirection = 'LeftToRight'
+    $btnPanel.AutoSize      = $true
+    $btnPanel.AutoSizeMode  = 'GrowAndShrink'
+    $btnPanel.Margin        = New-Object System.Windows.Forms.Padding(0)
+
+    $btnLogin = New-Object System.Windows.Forms.Button
+    $btnLogin.Text   = "&Login"
+    $btnLogin.Width  = 80
+    $btnLogin.Height = 28
+    $btnPanel.Controls.Add($btnLogin)
+
+    $btnCancel = New-Object System.Windows.Forms.Button
+    $btnCancel.Text         = "&Cancel"
+    $btnCancel.Width        = 80
+    $btnCancel.Height       = 28
     $btnCancel.DialogResult = [System.Windows.Forms.DialogResult]::Cancel
-    $form.Controls.Add($btnCancel)
+    $btnCancel.Margin       = New-Object System.Windows.Forms.Padding(6, 0, 0, 0)
+    $btnPanel.Controls.Add($btnCancel)
+
+    [void]$btnRow.Controls.Add($btnPanel, 2, 0)
+    [void]$tlp.Controls.Add($btnRow)
 
     $form.AcceptButton = $btnLogin
     $form.CancelButton = $btnCancel
@@ -461,7 +686,6 @@ function Show-LoginDialog {
                 StartOnStartup = $chkStartup.Checked
             }
 
-            # Handle config persistence based on user choice
             if ($chkSave.Checked -or $chkAutoLogin.Checked) {
                 Export-ProxyConfig `
                     -User           $script:guiResult.User `
@@ -474,15 +698,16 @@ function Show-LoginDialog {
                 if (Test-Path $script:Config.ConfigFile) { Remove-Item $script:Config.ConfigFile -Force -ErrorAction SilentlyContinue }
             }
 
-            # Startup registration
             if ($chkStartup.Checked) { Set-StartupEntry } else { Remove-StartupEntry }
 
             $form.DialogResult = [System.Windows.Forms.DialogResult]::OK
             $form.Close()
-        } else { [System.Windows.Forms.MessageBox]::Show("All fields required.") }
+        } else {
+            [System.Windows.Forms.MessageBox]::Show("All fields required.", "IITD Proxy Login", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Warning)
+        }
     })
-    
-    $form.Add_Shown({ $form.Activate(); if($txtUser.Text){$txtPass.Select()} })
+
+    $form.Add_Shown({ $form.Activate(); if ($txtUser.Text) { $txtPass.Select() } })
     $form.ShowDialog() | Out-Null
     return $script:guiResult
 }
@@ -496,34 +721,70 @@ function Show-LogViewer {
     }
 
     $script:logForm = New-Object System.Windows.Forms.Form
-    $script:logForm.Text = "Proxy Activity Log"
-    $script:logForm.Size = New-Object System.Drawing.Size(600, 400)
+    $script:logForm.Text          = "Proxy Activity Log"
+    $script:logForm.Size          = New-Object System.Drawing.Size(640, 420)
+    $script:logForm.MinimumSize   = New-Object System.Drawing.Size(420, 260)
     $script:logForm.StartPosition = "CenterScreen"
-    $script:logForm.Icon = [System.Drawing.Icon]::ExtractAssociatedIcon($PSHOME + "\powershell.exe")
+    $script:logForm.Font          = New-Object System.Drawing.Font("Segoe UI", 9)
+    $script:logForm.Icon          = [System.Drawing.Icon]::ExtractAssociatedIcon($PSHOME + "\powershell.exe")
 
-    $script:txtLogBox = New-Object System.Windows.Forms.TextBox
-    $script:txtLogBox.Multiline = $true
-    $script:txtLogBox.ScrollBars = "Vertical"
-    $script:txtLogBox.ReadOnly = $true
-    $script:txtLogBox.Dock = "Fill"
-    $script:txtLogBox.Font = New-Object System.Drawing.Font("Consolas", 9)
-    $script:txtLogBox.Text = $global:logHistory.ToString()
-    
-    $script:txtLogBox.SelectionStart = $script:txtLogBox.Text.Length
-    $script:txtLogBox.ScrollToCaret()
+    $script:txtLogBox = New-Object System.Windows.Forms.RichTextBox
+    $script:txtLogBox.ReadOnly      = $true
+    $script:txtLogBox.Dock          = "Fill"
+    $script:txtLogBox.BorderStyle   = [System.Windows.Forms.BorderStyle]::None
+    $script:txtLogBox.Font          = New-Object System.Drawing.Font("Consolas", 9)
+    $script:txtLogBox.BackColor     = [System.Drawing.Color]::White
+    $script:txtLogBox.WordWrap      = $false
+    $script:txtLogBox.DetectUrls    = $false
+    $script:txtLogBox.HideSelection = $false
+
+    # Replay history with colour. Each line is "[HH:MM:SS] [TYPE] message".
+    $rtb = $script:txtLogBox
+    $tagRegex = [regex]'^\[\d{2}:\d{2}:\d{2}\] \[([A-Z]+)\] '
+    foreach ($line in ($global:logHistory.ToString() -split "`r?`n")) {
+        if ([string]::IsNullOrEmpty($line)) { continue }
+        $m = $tagRegex.Match($line)
+        $type = if ($m.Success) { $m.Groups[1].Value } else { "INFO" }
+        Append-LogLine $rtb $line $type
+    }
 
     $script:logForm.Controls.Add($script:txtLogBox)
     $script:logForm.Show()
 }
 
 # ==========================================
+# ENTRY POINT HELPERS
+# ==========================================
+function Invoke-LoginFlow {
+    # Uses $script:creds (set by caller). Returns $true on success.
+    if ($script:creds.UpdateSys) {
+        Initialize-SystemProxy -Category $script:creds.Cat
+    } else {
+        Write-Log "Skipping Windows Proxy Update (User Opt-out)" "INFO"
+    }
+    Initialize-ProxyEnvironment -Category $script:creds.Cat
+    return (Connect-ProxySession)
+}
+
+function Show-LoginErrorAndExit {
+    $lastLog = $global:logHistory.ToString().Trim()
+    $lastLines = $lastLog -split "`r`n"
+    $errorReason = $(if ($lastLines) { $lastLines[-1] } else { "Unknown Error" })
+    [System.Windows.Forms.MessageBox]::Show("Login Failed.`n$errorReason", "Error")
+    exit
+}
+
+# ==========================================
 # ENTRY POINT
 # ==========================================
 # Initialize Icons
-$script:iconGood = Create-StatusIcon -Color ([System.Drawing.Color]::LimeGreen) -Shape "Circle"
-$script:iconBad  = Create-StatusIcon -Color ([System.Drawing.Color]::Red) -Shape "Octagon"
+$script:iconGood = New-StatusIcon -Color ([System.Drawing.Color]::LimeGreen) -Shape "Circle"
+$script:iconBad  = New-StatusIcon -Color ([System.Drawing.Color]::Red)       -Shape "Octagon"
 
-# Load Config
+# Snapshot Windows proxy state up front so Restore-SystemProxy can put it back on exit
+Save-OriginalSystemProxy
+
+# Load saved config
 $saved = Import-ProxyConfig
 
 # Auto-login path: skip GUI entirely if creds are fully saved
@@ -538,73 +799,120 @@ if ($saved -and $saved.AutoLogin -and $saved.Password -and $saved.Username -and 
     }
     $didAutoLogin = $true
 } else {
-    # Normal login path
     $script:creds = Show-LoginDialog -SavedConfig $saved
 }
 
 if (-not $script:creds) { exit }
 
-if ($script:creds.UpdateSys) {
-    Initialize-SystemProxy -Category $script:creds.Cat
-} else {
-    Write-Log "Skipping Windows Proxy Update (User Opt-out)" "INFO"
+$loginOk = Invoke-LoginFlow
+
+# Auto-login failed -> assume saved password is stale; clear it and fall back to manual login
+if (-not $loginOk -and $didAutoLogin) {
+    Write-Log "Auto-login failed, falling back to manual login" "WARN"
+    Clear-SavedPassword
+    $saved = Import-ProxyConfig
+    $script:creds = Show-LoginDialog -SavedConfig $saved
+    if (-not $script:creds) { exit }
+    $didAutoLogin = $false  # don't tag the success log line as [auto]
+    $loginOk = Invoke-LoginFlow
 }
 
-Initialize-ProxyEnvironment -Category $script:creds.Cat
+if (-not $loginOk) { Show-LoginErrorAndExit }
 
-if (Connect-ProxySession) {
-    Write-Log "Login Successful as $($script:creds.User)$(if($didAutoLogin){' [auto]'})" "SUCCESS"
-} else {
-    # Auto-login failed -> fall back to manual login dialog
-    if ($didAutoLogin) {
-        Write-Log "Auto-login failed, falling back to manual login" "WARN"
-        $script:creds = Show-LoginDialog -SavedConfig $saved
-        if (-not $script:creds) { exit }
-        if ($script:creds.UpdateSys) {
-            Initialize-SystemProxy -Category $script:creds.Cat
-        }
-        Initialize-ProxyEnvironment -Category $script:creds.Cat
-        if (-not (Connect-ProxySession)) {
-            $lastLog = $global:logHistory.ToString().Trim()
-            $lastLines = $lastLog -split "`r`n"
-            $errorReason = $(if ($lastLines) { $lastLines[-1] } else { "Unknown Error" })
-            [System.Windows.Forms.MessageBox]::Show("Login Failed.`n$errorReason", "Error")
-            exit
-        }
-    } else {
-        $lastLog = $global:logHistory.ToString().Trim()
-        $lastLines = $lastLog -split "`r`n"
-        $errorReason = $(if ($lastLines) { $lastLines[-1] } else { "Unknown Error" })
-        [System.Windows.Forms.MessageBox]::Show("Login Failed.`n$errorReason", "Error")
-        exit
-    }
-}
+Write-Log "Login Successful as $($script:creds.User)$(if($didAutoLogin){' [auto]'})" "SUCCESS"
 
-# Setup Tray Icon
+# ==========================================
+# TRAY ICON + MENU
+# ==========================================
 $script:notifyIcon = New-Object System.Windows.Forms.NotifyIcon
 $script:notifyIcon.Visible = $true
 Update-TrayStatus "Connected" "Good"
-$script:notifyIcon.ShowBalloonTip(5000, "IITD Proxy", "Proxy Login Successful.`nSystem Tray Active. Right-click to Logout & Exit.", [System.Windows.Forms.ToolTipIcon]::Info)
-
+$script:notifyIcon.ShowBalloonTip(5000, "IITD Proxy", "Proxy Login Successful.`nSystem Tray Active. Right-click for menu.", [System.Windows.Forms.ToolTipIcon]::Info)
 $script:notifyIcon.add_DoubleClick({ Show-LogViewer })
 
-$contextMenu = New-Object System.Windows.Forms.ContextMenu
-$menuItemLog = $contextMenu.MenuItems.Add("View Logs")
-$menuItemLog.add_Click({ Show-LogViewer })
+# Modern themed context menu (replaces deprecated ContextMenu)
+$cms = New-Object System.Windows.Forms.ContextMenuStrip
+$cms.Font = New-Object System.Drawing.Font("Segoe UI", 9)
 
-$contextMenu.MenuItems.Add("-")
+# Disabled header item: at-a-glance "you are here" indicator
+$miHeader = New-Object System.Windows.Forms.ToolStripMenuItem
+$miHeader.Text = "$($script:creds.User)  ($($script:creds.Cat))"
+$miHeader.Enabled = $false
+$miHeader.Font = New-Object System.Drawing.Font("Segoe UI", 9, [System.Drawing.FontStyle]::Bold)
+[void]$cms.Items.Add($miHeader)
+[void]$cms.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
 
-$menuItemExit = $contextMenu.MenuItems.Add("Logout & Exit")
-$menuItemExit.add_Click({ 
+$miReconnect = New-Object System.Windows.Forms.ToolStripMenuItem
+$miReconnect.Text = "&Reconnect Now"
+$miReconnect.add_Click({
+    Write-Log "Manual reconnect requested" "INFO"
+    Update-TrayStatus "Reconnecting..." "Bad"
+    if (Connect-ProxySession) {
+        Write-Log "Manual reconnect successful" "SUCCESS"
+        Update-TrayStatus "Connected" "Good"
+    } else {
+        Write-Log "Manual reconnect failed" "ERROR"
+    }
+})
+[void]$cms.Items.Add($miReconnect)
+
+$miLog = New-Object System.Windows.Forms.ToolStripMenuItem
+$miLog.Text = "&View Logs"
+$miLog.add_Click({ Show-LogViewer })
+[void]$cms.Items.Add($miLog)
+
+[void]$cms.Items.Add((New-Object System.Windows.Forms.ToolStripSeparator))
+
+$miExit = New-Object System.Windows.Forms.ToolStripMenuItem
+$miExit.Text = "&Logout && Exit"   # `&&` renders as a literal '&'
+$miExit.add_Click({
     Disconnect-ProxySession
+    Restore-SystemProxy
+    if ($script:netHandler) {
+        try { [System.Net.NetworkInformation.NetworkChange]::remove_NetworkAvailabilityChanged($script:netHandler) } catch {}
+    }
     $script:notifyIcon.Visible = $false
     $script:notifyIcon.Dispose()
     if ($script:timer) { $script:timer.Stop(); $script:timer.Dispose() }
-    [System.Windows.Forms.Application]::Exit() 
+    if ($script:invisibleHost -and -not $script:invisibleHost.IsDisposed) { $script:invisibleHost.Dispose() }
+    if ($script:mutex) { try { $script:mutex.ReleaseMutex() } catch {}; $script:mutex.Dispose() }
+    [System.Windows.Forms.Application]::Exit()
 })
-$script:notifyIcon.ContextMenu = $contextMenu
+[void]$cms.Items.Add($miExit)
 
-# Start Keep-Alive Loop
+$script:notifyIcon.ContextMenuStrip = $cms
+
+# ==========================================
+# CROSS-THREAD MARSHALING + NETWORK CHANGE
+# ==========================================
+# Invisible host form gives us a UI-thread BeginInvoke target for events
+# raised on background threads (e.g. NetworkChange).
+$script:invisibleHost = New-Object System.Windows.Forms.Form
+$script:invisibleHost.ShowInTaskbar  = $false
+$script:invisibleHost.WindowState    = [System.Windows.Forms.FormWindowState]::Minimized
+$script:invisibleHost.FormBorderStyle = [System.Windows.Forms.FormBorderStyle]::None
+$script:invisibleHost.Opacity        = 0
+$null = $script:invisibleHost.Handle  # force handle creation on the UI thread
+
+# Network availability change -> trigger an immediate keep-alive instead of
+# waiting up to 2 minutes for the next timer tick. Common after Wi-Fi reconnect
+# or wake-from-sleep.
+$script:netHandler = [System.Net.NetworkInformation.NetworkAvailabilityChangedEventHandler]{
+    param($eventSender, $e)
+    if ($e.IsAvailable -and $script:invisibleHost -and -not $script:invisibleHost.IsDisposed) {
+        try {
+            $script:invisibleHost.BeginInvoke([Action]{
+                Write-Log "Network reconnected - running keep-alive" "INFO"
+                Send-KeepAlive
+            }) | Out-Null
+        } catch {}
+    }
+}
+[System.Net.NetworkInformation.NetworkChange]::add_NetworkAvailabilityChanged($script:netHandler)
+
+# ==========================================
+# KEEP-ALIVE TIMER + MESSAGE LOOP
+# ==========================================
 $script:timer = New-Object System.Windows.Forms.Timer
 $script:timer.Interval = $script:Config.KeepAliveInterval * 1000
 $script:timer.Add_Tick({ Send-KeepAlive })
